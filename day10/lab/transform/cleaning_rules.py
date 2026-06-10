@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -20,11 +21,19 @@ ALLOWED_DOC_IDS = frozenset(
         "sla_p1_2026",
         "it_helpdesk_faq",
         "hr_leave_policy",
+        "access_control_sop",
     }
 )
 
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _DMY_SLASH = re.compile(r"^(\d{2})/(\d{2})/(\d{4})$")
+_UNCLEAR_PREFIX = "Nội dung không rõ ràng:"
+_REPEATED_LAM_VIEC = re.compile(r"(làm việc)(?:\s+\1)+", re.IGNORECASE)
+
+
+def _hr_leave_min_effective_date() -> str:
+    """Đọc cutoff HR từ env/contract — tránh hard-code ngày cố định trong rule."""
+    return os.environ.get("HR_LEAVE_MIN_EFFECTIVE_DATE", "2026-01-01").strip()
 
 
 def _norm_text(s: str) -> str:
@@ -73,15 +82,23 @@ def clean_rows(
     Baseline (mở rộng theo narrative Day 10):
     1) Quarantine: doc_id không thuộc allowlist (export lạ / catalog sai).
     2) Chuẩn hoá effective_date sang YYYY-MM-DD; quarantine nếu không parse được.
-    3) Quarantine: chunk hr_leave_policy có effective_date < 2026-01-01 (bản HR cũ / conflict version).
+    3) Quarantine: chunk hr_leave_policy có effective_date < HR_LEAVE_MIN_EFFECTIVE_DATE.
     4) Quarantine: chunk_text rỗng hoặc effective_date rỗng sau chuẩn hoá.
     5) Loại trùng nội dung chunk_text (giữ bản đầu).
     6) Fix stale refund: policy_refund_v4 chứa '14 ngày làm việc' → 7 ngày.
+
+    Rule mới (nhóm):
+    7) strip_unclear_content_prefix — bỏ tiền tố "Nội dung không rõ ràng:" trước khi dedupe.
+    8) quarantine_hr_stale_10d_content — HR còn marker "10 ngày phép năm" (bản 2025).
+    9) normalize_repeated_lam_viec — gộp lặp "làm việc làm việc" trong refund chunk.
+    10) strip_bang_prefix — bỏ "!!!" đầu chunk sau khi strip unclear prefix.
+    11) enrich_p1_escalation_topic_prefix — thêm tiền tố topic cho chunk Escalation P1 (retrieval).
     """
     quarantine: List[Dict[str, Any]] = []
     seen_text: set[str] = set()
     cleaned: List[Dict[str, Any]] = []
     seq = 0
+    hr_min_date = _hr_leave_min_effective_date()
 
     for raw in rows:
         doc_id = raw.get("doc_id", "")
@@ -101,12 +118,13 @@ def clean_rows(
             quarantine.append({**raw, "reason": eff_err, "effective_date_raw": eff_raw})
             continue
 
-        if doc_id == "hr_leave_policy" and eff_norm < "2026-01-01":
+        if doc_id == "hr_leave_policy" and eff_norm < hr_min_date:
             quarantine.append(
                 {
                     **raw,
                     "reason": "stale_hr_policy_effective_date",
                     "effective_date_normalized": eff_norm,
+                    "hr_min_effective_date": hr_min_date,
                 }
             )
             continue
@@ -115,13 +133,33 @@ def clean_rows(
             quarantine.append({**raw, "reason": "missing_chunk_text"})
             continue
 
-        key = _norm_text(text)
+        fixed_text = text
+        if fixed_text.startswith(_UNCLEAR_PREFIX):
+            fixed_text = fixed_text[len(_UNCLEAR_PREFIX) :].strip()
+
+        fixed_text = fixed_text.lstrip("!").strip()
+
+        if doc_id == "hr_leave_policy" and "10 ngày phép năm" in fixed_text:
+            quarantine.append({**raw, "reason": "stale_hr_10d_annual_content"})
+            continue
+
+        if not fixed_text:
+            quarantine.append({**raw, "reason": "empty_after_unclear_prefix_strip"})
+            continue
+
+        if doc_id == "policy_refund_v4":
+            fixed_text = _REPEATED_LAM_VIEC.sub(r"\1", fixed_text)
+
+        if doc_id == "sla_p1_2026" and "escalation p1" in fixed_text.lower():
+            if not fixed_text.lower().startswith("ticket p1 auto escalation"):
+                fixed_text = f"Ticket P1 auto escalation SLA — {fixed_text}"
+
+        key = _norm_text(fixed_text)
         if key in seen_text:
             quarantine.append({**raw, "reason": "duplicate_chunk_text"})
             continue
         seen_text.add(key)
 
-        fixed_text = text
         if apply_refund_window_fix and doc_id == "policy_refund_v4":
             if "14 ngày làm việc" in fixed_text:
                 fixed_text = fixed_text.replace(

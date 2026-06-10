@@ -112,5 +112,58 @@ def run_expectations(cleaned_rows: List[Dict[str, Any]]) -> Tuple[List[Expectati
         )
     )
 
+    # E7 (mới): đủ 5 nguồn canonical trong cleaned — phát hiện allowlist thiếu doc
+    required_docs = {
+        "policy_refund_v4",
+        "sla_p1_2026",
+        "it_helpdesk_faq",
+        "hr_leave_policy",
+        "access_control_sop",
+    }
+    present_docs = {r.get("doc_id") for r in cleaned_rows if r.get("doc_id")}
+    missing_docs = sorted(required_docs - present_docs)
+    ok7 = len(missing_docs) == 0
+    results.append(
+        ExpectationResult(
+            "required_kb_doc_ids_present",
+            ok7,
+            "halt",
+            f"missing={missing_docs}",
+        )
+    )
+
+    # E8 (mới): không còn marker parser lỗi sau rule strip prefix
+    unclear = [
+        r
+        for r in cleaned_rows
+        if "nội dung không rõ ràng" in (r.get("chunk_text") or "").lower()
+    ]
+    ok8 = len(unclear) == 0
+    results.append(
+        ExpectationResult(
+            "no_unclear_content_marker",
+            ok8,
+            "halt",
+            f"violations={len(unclear)}",
+        )
+    )
+
+    # E9 (mới): HR 2026 phải còn ít nhất một chunk 12 ngày phép năm
+    hr_12d = [
+        r
+        for r in cleaned_rows
+        if r.get("doc_id") == "hr_leave_policy"
+        and "12 ngày phép năm" in (r.get("chunk_text") or "")
+    ]
+    ok9 = len(hr_12d) >= 1
+    results.append(
+        ExpectationResult(
+            "hr_leave_has_12d_annual",
+            ok9,
+            "warn",
+            f"rows_with_12d={len(hr_12d)}",
+        )
+    )
+
     halt = any(not r.passed and r.severity == "halt" for r in results)
     return results, halt

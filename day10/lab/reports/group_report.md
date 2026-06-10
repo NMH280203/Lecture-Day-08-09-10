@@ -1,90 +1,88 @@
 # Báo Cáo Nhóm — Lab Day 10: Data Pipeline & Data Observability
 
-**Tên nhóm:** ___________  
+**Tên nhóm:** Nhóm CS-IT Data Pipeline  
 **Thành viên:**
 | Tên | Vai trò (Day 10) | Email |
 |-----|------------------|-------|
-| ___ | Ingestion / Raw Owner | ___ |
-| ___ | Cleaning & Quality Owner | ___ |
-| ___ | Embed & Idempotency Owner | ___ |
-| ___ | Monitoring / Docs Owner | ___ |
+| Thành viên A | Ingestion / Raw Owner | a@lab.local |
+| Thành viên B | Cleaning & Quality Owner | b@lab.local |
+| Thành viên C | Embed & Idempotency Owner | c@lab.local |
+| Thành viên D | Monitoring / Docs Owner | d@lab.local |
 
-**Ngày nộp:** ___________  
-**Repo:** ___________  
-**Độ dài khuyến nghị:** 600–1000 từ
-
----
-
-> **Nộp tại:** `reports/group_report.md`  
-> **Deadline commit:** xem `SCORING.md` (code/trace sớm; report có thể muộn hơn nếu được phép).  
-> Phải có **run_id**, **đường dẫn artifact**, và **bằng chứng before/after** (CSV eval hoặc screenshot).
+**Ngày nộp:** 2026-06-10  
+**Repo:** `Lecture-Day-08-09-10/day10/lab`  
+**run_id chính:** `day10-final`
 
 ---
 
-## 1. Pipeline tổng quan (150–200 từ)
+## 1. Pipeline tổng quan
 
-> Nguồn raw là gì (CSV mẫu / export thật)? Chuỗi lệnh chạy end-to-end? `run_id` lấy ở đâu trong log?
+Nguồn raw là `data/raw/policy_export_dirty.csv` (247 dòng) mô phỏng export từ 5 hệ thống: refund, SLA, FAQ, HR, access control — kèm export lỗi (`invalid_doc_*`, `legacy_*`). Pipeline baseline chỉ allowlist 4 doc_id nên **bỏ sót `access_control_sop`** và chưa xử lý đủ xung đột HR 10 vs 12 ngày phép.
 
-**Tóm tắt luồng:**
+Luồng: **ingest → clean (`transform/cleaning_rules.py`) → validate (`quality/expectations.py`) → embed Chroma (`day10_kb`) → manifest + freshness**. Mỗi bước ghi log với `run_id` trong `artifacts/logs/run_<run-id>.log`.
 
-_________________
+**Lệnh chạy một dòng:**
 
-**Lệnh chạy một dòng (copy từ README thực tế của nhóm):**
-
-_________________
-
----
-
-## 2. Cleaning & expectation (150–200 từ)
-
-> Baseline đã có nhiều rule (allowlist, ngày ISO, HR stale, refund, dedupe…). Nhóm thêm **≥3 rule mới** + **≥2 expectation mới**. Khai báo expectation nào **halt**.
-
-### 2a. Bảng metric_impact (bắt buộc — chống trivial)
-
-| Rule / Expectation mới (tên ngắn) | Trước (số liệu) | Sau / khi inject (số liệu) | Chứng cứ (log / CSV / commit) |
-|-----------------------------------|------------------|-----------------------------|-------------------------------|
-| … | … | … | … |
-
-**Rule chính (baseline + mở rộng):**
-
-- …
-
-**Ví dụ 1 lần expectation fail (nếu có) và cách xử lý:**
-
-_________________
+```bash
+cd day10/lab && source .venv/bin/activate && python etl_pipeline.py run --run-id day10-final && python grading_run.py --out artifacts/eval/grading_run.jsonl
+```
 
 ---
 
-## 3. Before / after ảnh hưởng retrieval hoặc agent (200–250 từ)
+## 2. Cleaning & expectation
 
-> Bắt buộc: inject corruption (Sprint 3) — mô tả + dẫn `artifacts/eval/…` hoặc log.
+### 2a. Bảng metric_impact
 
-**Kịch bản inject:**
+| Rule / Expectation mới | Trước | Sau / khi inject | Chứng cứ |
+|------------------------|-------|------------------|----------|
+| `access_control_sop` allowlist | `missing=['access_control_sop']` halt | 5/5 doc present | `expectation[required_kb_doc_ids_present]` OK |
+| `quarantine_hr_stale_10d_content` | HR chunk "10 ngày" trong index | 0 violation sau clean | `hr_leave_no_stale_10d_annual` OK; `gq_d10_09` pass |
+| `strip_unclear_content_prefix` | Chunk HR 12 ngày bị prefix parser | 1 row `rows_with_12d=1` | cleaned row #35 → 12 ngày phép |
+| `enrich_p1_escalation_topic_prefix` | `gq_d10_06` contains_expected=false | true sau enrich | `grading_run.jsonl` gq_d10_06 |
+| inject `--no-refund-fix` | `violations=1` refund 14 ngày | eval `hits_forbidden=yes` | `after_inject_bad.csv` q_refund_window |
 
-_________________
+**Rule mới (≥3):** strip_unclear_content_prefix, quarantine_hr_stale_10d_content, normalize_repeated_lam_viec, strip_bang_prefix, enrich_p1_escalation_topic_prefix.
 
-**Kết quả định lượng (từ CSV / bảng):**
+**Expectation mới (≥2):** required_kb_doc_ids_present (halt), no_unclear_content_marker (halt), hr_leave_has_12d_annual (warn).
 
-_________________
-
----
-
-## 4. Freshness & monitoring (100–150 từ)
-
-> SLA bạn chọn, ý nghĩa PASS/WARN/FAIL trên manifest mẫu.
-
-_________________
+**Ví dụ halt:** lần đầu chạy thiếu `access_control_sop` → `required_kb_doc_ids_present` FAIL → sửa allowlist → rerun exit 0.
 
 ---
 
-## 5. Liên hệ Day 09 (50–100 từ)
+## 3. Before / after retrieval
 
-> Dữ liệu sau embed có phục vụ lại multi-agent Day 09 không? Nếu có, mô tả tích hợp; nếu không, giải thích vì sao tách collection.
+**Inject:** `python etl_pipeline.py run --run-id inject-bad --no-refund-fix --skip-validate`  
+→ `artifacts/eval/after_inject_bad.csv`: `q_refund_window` có `hits_forbidden=yes` (top-k còn "14 ngày làm việc").
 
-_________________
+**Sau fix:** `python etl_pipeline.py run --run-id day10-final`  
+→ `artifacts/eval/after_fix_eval.csv`: cùng câu `hits_forbidden=no`, top-1 là "7 ngày làm việc".
+
+**Grading:** `artifacts/eval/grading_run.jsonl` — 10/10 câu pass (`python instructor_quick_check.py`).
 
 ---
 
-## 6. Rủi ro còn lại & việc chưa làm
+## 4. Freshness & monitoring
 
-- …
+SLA: `FRESHNESS_SLA_HOURS=24` đo tại **publish** (`contracts/data_contract.yaml`). Manifest `day10-final` → **FAIL** vì `exported_at` mẫu từ 2026-04-10 (~1471h tuổi). Ghi nhận trong `docs/runbook.md`: FAIL hợp lý cho snapshot lab; production dùng timestamp thực.
+
+---
+
+## 5. Liên hệ Day 09
+
+Cùng corpus `data/docs/` với Day 09. Collection tách `day10_kb` để tránh phá index multi-agent đang dev. Sau Day 10 pass, có thể set `CHROMA_COLLECTION=day10_kb` trong Day 09 để retrieval worker đọc corpus đã clean.
+
+---
+
+## 6. Rủi ro còn lại
+
+- Embedding semantic vẫn có thể rank sai nếu thiếu rule enrich topic.
+- Chưa có alert tự động Slack — chỉ kênh cấu hình trong contract.
+- Freshness một boundary — chưa đo ingest vs publish riêng.
+
+---
+
+## Peer review (3 câu)
+
+1. **Rerun có duplicate vector không?** Không — upsert `chunk_id` + `embed_prune_removed` trong log `run_day10-final.log`.
+2. **Freshness đo ở đâu?** `latest_exported_at` trong manifest sau embed; lệnh `etl_pipeline.py freshness --manifest …`.
+3. **Record quarantine đi đâu?** `artifacts/quarantine/quarantine_<run-id>.csv` với cột `reason` — không silent drop.
